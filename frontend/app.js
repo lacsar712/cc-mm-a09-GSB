@@ -1,20 +1,40 @@
 const tokenKey = "methane_token";
 let token = localStorage.getItem(tokenKey) || "";
 let role = localStorage.getItem("methane_role") || "";
+let currentView = "board";
 
 const loginBox = document.querySelector("#login");
 const appBox = document.querySelector("#app");
 const rows = document.querySelector("#rows");
 const live = document.querySelector("#live");
 const form = document.querySelector("#form");
+const viewBoard = document.querySelector("#view-board");
+const viewCritical = document.querySelector("#view-critical");
+const criticalRows = document.querySelector("#critical-rows");
+const criticalEmpty = document.querySelector("#critical-empty");
+const lineValue = document.querySelector("#line-value");
+const lineForm = document.querySelector("#line-form");
+const lineInput = document.querySelector("#line-input");
+const lineMsg = document.querySelector("#line-msg");
+
+function levelClass(level) {
+  if (level === "危急") return "critical";
+  if (level === "报警") return "alarm";
+  return "ok";
+}
+
+function rowHtml(r) {
+  return `<tr><td>${r.site}</td><td>${r.ch4_pct}</td><td class="${levelClass(r.level)}">${r.level}</td><td>${r.note}</td></tr>`;
+}
 
 function paint(list) {
-  rows.innerHTML = list
-    .map(
-      (r) =>
-        `<tr><td>${r.site}</td><td>${r.ch4_pct}</td><td class="${r.level === "报警" ? "alarm" : "ok"}">${r.level}</td><td>${r.note}</td></tr>`,
-    )
-    .join("");
+  rows.innerHTML = list.map(rowHtml).join("");
+}
+
+function paintCritical(data) {
+  lineValue.textContent = data.critical_line;
+  criticalRows.innerHTML = data.items.map(rowHtml).join("");
+  criticalEmpty.hidden = data.items.length > 0;
 }
 
 async function api(path, options = {}) {
@@ -31,18 +51,33 @@ async function api(path, options = {}) {
   return data;
 }
 
+function showView(name) {
+  currentView = name;
+  viewBoard.hidden = name !== "board";
+  viewCritical.hidden = name !== "critical";
+  document.querySelector("#nav-board").classList.toggle("active", name === "board");
+  document.querySelector("#nav-critical").classList.toggle("active", name === "critical");
+  if (name === "critical") loadCritical();
+  else load();
+}
+
 function showApp() {
   loginBox.hidden = true;
   appBox.hidden = false;
   document.querySelector("#who").textContent = role === "writer" ? "检查员" : "查看";
   document.querySelector("#out").hidden = false;
   form.hidden = role !== "writer";
+  lineForm.hidden = role !== "writer";
   connect();
-  load();
+  showView("board");
 }
 
 async function load() {
   paint(await api("/api/readings"));
+}
+
+async function loadCritical() {
+  paintCritical(await api("/api/critical"));
 }
 
 function connect() {
@@ -51,9 +86,13 @@ function connect() {
   ws.onmessage = (ev) => {
     const row = JSON.parse(ev.data);
     live.textContent = `刚推送：${row.site} ${row.level}`;
-    load();
+    if (currentView === "critical") loadCritical();
+    else load();
   };
 }
+
+document.querySelector("#nav-board").onclick = () => showView("board");
+document.querySelector("#nav-critical").onclick = () => showView("critical");
 
 document.querySelector("#go").onclick = async () => {
   const data = await api("/api/auth/login", {
@@ -82,6 +121,22 @@ form.onsubmit = async (e) => {
     });
   } catch (err) {
     live.textContent = err.message;
+  }
+};
+
+lineForm.onsubmit = async (e) => {
+  e.preventDefault();
+  lineMsg.textContent = "";
+  try {
+    const data = await api("/api/settings/critical-line", {
+      method: "PUT",
+      body: JSON.stringify({ critical_line: Number(lineInput.value) }),
+    });
+    lineMsg.textContent = `已保存：${data.critical_line}%`;
+    lineInput.value = "";
+    loadCritical();
+  } catch (err) {
+    lineMsg.textContent = err.message;
   }
 };
 

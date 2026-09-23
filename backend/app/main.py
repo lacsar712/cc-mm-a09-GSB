@@ -6,10 +6,10 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from sqlalchemy import DateTime, Float, String, create_engine
+from sqlalchemy import DateTime, Float, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from app.rules import classify
+from app.rules import ALARM_LINE, DEFAULT_CRITICAL_LINE, classify
 
 
 class Settings(BaseSettings):
@@ -44,6 +44,12 @@ class Reading(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class Setting(Base):
+    __tablename__ = "settings"
+    key: Mapped[str] = mapped_column(String(40), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -52,6 +58,10 @@ class LoginIn(BaseModel):
 class ReadingIn(BaseModel):
     site: str = Field(min_length=1, max_length=80)
     ch4_pct: float
+
+
+class CriticalLineIn(BaseModel):
+    critical_line: float = Field(gt=ALARM_LINE)
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -69,8 +79,30 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(secu
 
 def require_writer(user: dict = Depends(current_user)) -> dict:
     if user["role"] != "writer":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅瓦斯检查员可上报")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅瓦斯检查员可操作")
     return user
+
+
+CRITICAL_KEY = "critical_line"
+
+
+def get_critical_line(db: Session) -> float:
+    row = db.get(Setting, CRITICAL_KEY)
+    if row is None:
+        return DEFAULT_CRITICAL_LINE
+    try:
+        return float(row.value)
+    except ValueError:
+        return DEFAULT_CRITICAL_LINE
+
+
+def set_critical_line(db: Session, value: float) -> None:
+    row = db.get(Setting, CRITICAL_KEY)
+    if row is None:
+        db.add(Setting(key=CRITICAL_KEY, value=str(value)))
+    else:
+        row.value = str(value)
+    db.commit()
 
 
 sockets: set[WebSocket] = set()
@@ -140,11 +172,60 @@ def list_readings(_user: dict = Depends(current_user)):
         db.close()
 
 
-@app.post("/api/readings", status_code=201)
-async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
-    level, note = classify(body.ch4_pct)
+@app.get("/api/critical")
+def list_critical(_user: dict = Depends(current_user)):
     db = SessionLocal()
     try:
+        critical_line = get_critical_line(db)
+        rows = (
+            db.query(Reading)
+            .filter(Reading.level == "危急")
+            .order_by(Reading.id.desc())
+            .all()
+        )
+        return {
+            "critical_line": critical_line,
+            "items": [
+                {
+                    "id": r.id,
+                    "site": r.site,
+                    "ch4_pct": r.ch4_pct,
+                    "level": r.level,
+                    "note": r.note,
+                    "created_by": r.created_by,
+                }
+                for r in rows
+            ],
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/settings/critical-line")
+def read_critical_line(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        return {"critical_line": get_critical_line(db)}
+    finally:
+        db.close()
+
+
+@app.put("/api/settings/critical-line")
+def update_critical_line(body: CriticalLineIn, _user: dict = Depends(require_writer)):
+    db = SessionLocal()
+    try:
+        set_critical_line(db, body.critical_line)
+        return {"critical_line": body.critical_line}
+    finally:
+        db.close()
+
+
+@app.post("/api/readings", status_code=201)
+async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
+    db = SessionLocal()
+    try:
+        critical_line = get_critical_line(db)
+        level, note = classify(body.ch4_pct, critical_line)
         row = Reading(
             site=body.site.strip(),
             ch4_pct=body.ch4_pct,
