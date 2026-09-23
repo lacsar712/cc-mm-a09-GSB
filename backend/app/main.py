@@ -6,10 +6,12 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from sqlalchemy import DateTime, Float, String, create_engine
+from sqlalchemy import DateTime, Float, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from app.rules import classify
+from app.rules import DEFAULT_CRITICAL_THRESHOLD, classify
+
+CRITICAL_KEY = "critical_threshold"
 
 
 class Settings(BaseSettings):
@@ -44,6 +46,12 @@ class Reading(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class Setting(Base):
+    __tablename__ = "settings"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -69,7 +77,7 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(secu
 
 def require_writer(user: dict = Depends(current_user)) -> dict:
     if user["role"] != "writer":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅瓦斯检查员可上报")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅瓦斯检查员可操作")
     return user
 
 
@@ -77,15 +85,35 @@ sockets: set[WebSocket] = set()
 app = FastAPI(title="矿井瓦斯班测台")
 
 
+def get_critical_threshold(db: Session) -> float:
+    row = db.get(Setting, CRITICAL_KEY)
+    if row is None:
+        return DEFAULT_CRITICAL_THRESHOLD
+    try:
+        return float(row.value)
+    except ValueError:
+        return DEFAULT_CRITICAL_THRESHOLD
+
+
+def set_critical_threshold(db: Session, value: float) -> None:
+    row = db.get(Setting, CRITICAL_KEY)
+    if row is None:
+        db.add(Setting(key=CRITICAL_KEY, value=str(value)))
+    else:
+        row.value = str(value)
+    db.commit()
+
+
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
+        critical = get_critical_threshold(db)
         if db.query(Reading).count() == 0:
             now = datetime.now(timezone.utc)
             for site, ch4 in (("东翼-12", 0.35), ("回风巷", 1.4)):
-                level, note = classify(ch4)
+                level, note = classify(ch4, critical)
                 db.add(
                     Reading(
                         site=site,
@@ -121,10 +149,13 @@ def login(body: LoginIn):
 
 
 @app.get("/api/readings")
-def list_readings(_user: dict = Depends(current_user)):
+def list_readings(level: str | None = None, _user: dict = Depends(current_user)):
     db = SessionLocal()
     try:
-        rows = db.query(Reading).order_by(Reading.id.desc()).all()
+        query = db.query(Reading)
+        if level is not None:
+            query = query.filter(Reading.level == level)
+        rows = query.order_by(Reading.id.desc()).all()
         return [
             {
                 "id": r.id,
@@ -140,11 +171,35 @@ def list_readings(_user: dict = Depends(current_user)):
         db.close()
 
 
-@app.post("/api/readings", status_code=201)
-async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
-    level, note = classify(body.ch4_pct)
+@app.get("/api/settings")
+def read_settings(_user: dict = Depends(current_user)):
     db = SessionLocal()
     try:
+        return {"critical_threshold": get_critical_threshold(db)}
+    finally:
+        db.close()
+
+
+class SettingsIn(BaseModel):
+    critical_threshold: float = Field(gt=1.0)
+
+
+@app.put("/api/settings")
+def update_settings(body: SettingsIn, _user: dict = Depends(require_writer)):
+    db = SessionLocal()
+    try:
+        set_critical_threshold(db, body.critical_threshold)
+        return {"critical_threshold": get_critical_threshold(db)}
+    finally:
+        db.close()
+
+
+@app.post("/api/readings", status_code=201)
+async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
+    db = SessionLocal()
+    try:
+        critical = get_critical_threshold(db)
+        level, note = classify(body.ch4_pct, critical)
         row = Reading(
             site=body.site.strip(),
             ch4_pct=body.ch4_pct,
